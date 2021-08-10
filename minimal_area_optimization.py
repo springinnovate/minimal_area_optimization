@@ -3,12 +3,11 @@ import argparse
 import logging
 import os
 
-import ecoshard.geoprocessing
+import pygeoprocessing
 import scipy.ndimage.morphology
 import numpy
 from osgeo import gdal
 from osgeo import osr
-import pulp
 
 
 gdal.SetCacheMax(2**27)
@@ -32,7 +31,7 @@ def _make_test_data(dir_path, n, m):
         base_array[pi, pj] = 0
         dist_array = scipy.ndimage.morphology.distance_transform_edt(
             base_array)
-        ecoshard.geoprocessing.numpy_array_to_raster(
+        pygeoprocessing.numpy_array_to_raster(
             dist_array, -1, (1, -1), (0, 0),
             osr.SRS_WKT_WGS84_LAT_LONG, raster_path)
         raster_path_list.append(raster_path)
@@ -45,10 +44,10 @@ def _callback(prob):
 
 def _sum_raster(raster_path):
     """Return the non-nodata sum of the raster."""
-    raster_info = ecoshard.geoprocessing.get_raster_info(raster_path)
+    raster_info = pygeoprocessing.get_raster_info(raster_path)
     nodata = raster_info['nodata'][0]
     running_sum = 0.0
-    for _, array in ecoshard.geoprocessing.iterblocks((raster_path, 1)):
+    for _, array in pygeoprocessing.iterblocks((raster_path, 1)):
         if nodata is not None:
             valid_mask = (array != nodata)
         else:
@@ -78,96 +77,101 @@ def multigrid_optimize(
             'area_list': [area of raster selected]
         }
     """
-    raster_info = ecoshard.geoprocessing.get_raster_info(raster_path_list[0])
+    raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
     sum_list = [_sum_raster(path) for path in raster_path_list]
 
     n_cols, n_rows = raster_info['raster_size']
 
-    n_col_steps = int(numpy.ceil(win_xsize / grid_size))
-    n_row_steps = int(numpy.ceil(win_ysize / grid_size))
-    while n_col_steps > 1 and n_row_steps > 1:
-        LOGGER.debug(f'{n_col_steps}, {n_row_steps}')
-        x_stepsize = win_xsize // n_col_steps
-        y_stepsize = win_ysize // n_row_steps
+    col_stepsize = max(win_xsize // grid_size, 1)
+    row_stepsize = max(win_ysize // grid_size, 1)
 
-        c_vector = numpy.ones(n_col_steps*n_row_steps)
-        A_list = []
-        b_list = []
+    n_col_grids = int(numpy.ceil(win_xsize / col_stepsize))
+    n_row_grids = int(numpy.ceil(win_xsize / row_stepsize))
 
-        for raster_path in raster_path_list:
-            LOGGER.info(f'processing {raster_path}')
-            raster = gdal.OpenEx(raster_path)
-            band = raster.GetRasterBand(1)
-            nodata = band.GetNoDataValue()
-            a_constraint_list = []
-            tot_val = 0.0
-            var_index = 0
-            offset_list = []
-            for x_index in range(n_col_steps):
-                local_xoff = x_index * x_stepsize
-                if (x_index+1)*x_stepsize < n_cols:
-                    local_win_xsize = x_stepsize
-                else:
-                    local_win_xsize = n_cols - (x_index+1)*n_col_steps
+    LOGGER.debug(f'{col_stepsize} {row_stepsize} {n_col_grids} {n_row_grids}')
 
-                for y_index in range(n_row_steps):
-                    local_yoff = y_index * y_stepsize
-                    if (y_index+1)*y_stepsize < n_rows:
-                        local_win_ysize = y_stepsize
-                    else:
-                        local_win_ysize = n_rows - (y_index+1)*y_stepsize
+    A_list = [[] for _ in range(len(raster_path_list))]
+    raster_sum_list = [0.0] * len(raster_path_list)
+    b_list = []
+    offset_list = []
+    for x_index in range(n_col_grids):
+        local_xoff = x_index * col_stepsize
+        local_win_xsize = col_stepsize
+        next_xoff = (x_index+1)*col_stepsize
+        if next_xoff >= n_cols:
+            local_win_xsize += n_cols-next_xoff-1
 
-                    tol = 1.0
+        for y_index in range(n_row_grids):
+            local_yoff = y_index * row_stepsize
+            local_win_ysize = row_stepsize
+            next_yoff = (y_index+1)*row_stepsize
+            if next_yoff >= n_rows:
+                local_win_ysize += n_rows-next_yoff-1
 
-                    # load the subgrid
-                    offset_dict = {
-                        'xoff': local_xoff,
-                        'yoff': local_yoff,
-                        'win_xsize': local_win_xsize,
-                        'win_ysize': local_win_ysize,
-                    }
-                    offset_list.append(offset_dict)
-                    array = band.ReadAsArray(**offset_dict)
-                    if nodata is not None:
-                        valid_mask = array != nodata
-                    else:
-                        valid_mask = numpy.ones(array.shape, dtype=bool)
-                    # aggregate it up to a single value
-                    array_sum = numpy.sum(array[valid_mask])
-                    a_constraint_list.append(-array_sum)
-                    tot_val += array_sum
-            A_list.append(a_constraint_list)
-            b_list.append(-min_proportion*tot_val)
+            tol = 1.0
 
-        c_vector = numpy.ones(len(a_constraint_list))
-        res = scipy.optimize.linprog(
-            c_vector,
-            A_ub=A_list,
-            b_ub=b_list,
-            bounds=[0, 1],
-            options={'tol': tol, 'disp': True})
-        for local_offset, local_prop in zip(offset_list, res.x):
-            LOGGER.debug(res.x)
-            multigrid_optimize(
-                raster_path_list, min_proportion, target_raster_path,
-                local_offset['xoff'], local_offset['yoff'],
-                local_offset['win_xsize'], local_offset['win_ysize'],
-                prop_tol=1e-12, grid_size=64,)
-        # iterate over each solution of x here and solve that subproblem
+            # load the subgrid
+            offset_dict = {
+                'xoff': local_xoff,
+                'yoff': local_yoff,
+                'win_xsize': local_win_xsize,
+                'win_ysize': local_win_ysize,
+            }
+            valid_mask = numpy.ones(
+                (local_win_ysize, local_win_xsize), dtype=bool)
+            array_list = []
+            for raster_path in raster_path_list:
+                raster = gdal.OpenEx(raster_path)
+                band = raster.GetRasterBand(1)
+                array = band.ReadAsArray(**offset_dict)
 
-                #LOGGER.debug(
-                #    f'sampling offset for x{var_index}\n'
-                #    f'\t{xoff}, {yoff}, {win_xsize}, {win_ysize} ({xoff+win_xsize}, {yoff+win_ysize})')
+                nodata = band.GetNoDataValue()
+                if nodata is not None:
+                    valid_mask &= (array != nodata)
 
-                #var_index += 1
+                array_list.append(array)
+            if not numpy.any(valid_mask):
+                continue
+            for array_index, array in enumerate(array_list):
+                grid_sum = numpy.sum(array[valid_mask])
+                A_list[array_index].append(-grid_sum)
+                raster_sum_list[array_index] += grid_sum
 
-        grid_size *= 2
-        n_col_steps = int(numpy.ceil(n_cols / grid_size))
-        n_row_steps = int(numpy.ceil(n_rows / grid_size))
+    # record the current grid offset for sub-multigrid
+    offset_list.append(offset_dict)
+    b_list = [-min_proportion*tot_val for tot_val in raster_sum_list]
+    tol = min([prop_tol*val for val in raster_sum_list])
+    c_vector = numpy.ones(len(A_list[0]))
+    res = scipy.optimize.linprog(
+        c_vector,
+        A_ub=A_list,
+        b_ub=b_list,
+        bounds=[0, 1],
+        options={'tol': tol, 'disp': True})
+    LOGGER.debug(res.x)
+    sys.exit()
+    for local_offset, local_prop in zip(offset_list, res.x):
+        LOGGER.debug(res.x)
+        multigrid_optimize(
+            raster_path_list, min_proportion, target_raster_path,
+            local_offset['xoff'], local_offset['yoff'],
+            local_offset['win_xsize'], local_offset['win_ysize'],
+            prop_tol=1e-12, grid_size=64,)
+    # iterate over each solution of x here and solve that subproblem
+
+            #LOGGER.debug(
+            #    f'sampling offset for x{var_index}\n'
+            #    f'\t{xoff}, {yoff}, {win_xsize}, {win_ysize} ({xoff+win_xsize}, {yoff+win_ysize})')
+
+            #var_index += 1
+
+    grid_size *= 2
+    n_col_steps = int(numpy.ceil(n_cols / grid_size))
+    n_row_steps = int(numpy.ceil(n_rows / grid_size))
 
 
 def _scipy_optimize(raster_path_list, min_proportion):
-    raster_info = ecoshard.geoprocessing.get_raster_info(raster_path_list[0])
+    raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
     n_rows, n_cols = raster_info['raster_size']
     LOGGER.info('construct area list')
     c_vector = numpy.ones(n_rows*n_cols)
@@ -196,6 +200,7 @@ def _scipy_optimize(raster_path_list, min_proportion):
     raster_results = [numpy.sum(A * res.x)/numpy.sum(A) for A in A_list]
     return res, tot_val, raster_results
 
+
 def main():
     """Entry point."""
     parser = argparse.ArgumentParser(description='Calc sum given min area')
@@ -214,9 +219,14 @@ def main():
     #problem, tot_val, raster_results = _scipy_optimize(raster_path_list, min_proportion)
 
     target_raster_path = 'result.tif'
+
+    raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
+    n_cols, n_rows = raster_info['raster_size']
+    LOGGER.debug(f'{n_rows} {n_cols}')
     multigrid_optimize(
         raster_path_list, min_proportion, target_raster_path,
-        prop_tol=1e-12, grid_size=64)
+        0, 0, n_cols, n_rows,
+        prop_tol=1e-12, grid_size=16)
     return
 
 
@@ -226,7 +236,7 @@ def main():
     result_proportion = problem.fun/tot_val
     LOGGER.info(f'result\n\tarea_proportion: {area_proportion:.3f}\n\tsolution proportion for each raster: {raster_results}')
     LOGGER.info(problem.x)
-    ecoshard.geoprocessing.numpy_array_to_raster(
+    pygeoprocessing.numpy_array_to_raster(
         (problem.x).reshape((n, n)), -1, (1, -1), (0, 0),
         osr.SRS_WKT_WGS84_LAT_LONG, 'result.tif')
     #for v in problem.variables():
