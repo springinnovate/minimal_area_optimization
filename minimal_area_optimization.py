@@ -67,6 +67,9 @@ def multigrid_optimize(
             use for value objective matching.
         min_proportion (float): minimum proportion of rasters to optimize
             for.
+        target_raster_path (str): path to target mask raster
+        win_xoff, win_yoff, win_xsize, win_ysize (int): the offset into the
+            global rasters to solve a sub optimization problem on.
         prop_tol (float): propotion of raster sum to use as tolerance.
         grid_size (int): the size to subdivide the optimization problem on.
 
@@ -78,7 +81,6 @@ def multigrid_optimize(
         }
     """
     raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
-    sum_list = [_sum_raster(path) for path in raster_path_list]
 
     n_cols, n_rows = raster_info['raster_size']
 
@@ -94,16 +96,16 @@ def multigrid_optimize(
     b_list = []
     offset_list = []
     for x_index in range(n_col_grids):
-        local_xoff = x_index * col_stepsize
+        local_xoff = win_xoff + x_index * col_stepsize
         local_win_xsize = col_stepsize
-        next_xoff = (x_index+1)*col_stepsize
+        next_xoff = win_xoff + (x_index+1)*col_stepsize
         if next_xoff > n_cols:
             local_win_xsize += n_cols-next_xoff
 
         for y_index in range(n_row_grids):
-            local_yoff = y_index * row_stepsize
+            local_yoff = win_yoff + y_index * row_stepsize
             local_win_ysize = row_stepsize
-            next_yoff = (y_index+1)*row_stepsize
+            next_yoff = win_yoff + (y_index+1)*row_stepsize
             if next_yoff > n_rows:
                 local_win_ysize += n_rows-next_yoff
 
@@ -155,7 +157,7 @@ def multigrid_optimize(
     mask_array[~valid_mask] = 0
 
     if col_stepsize == 1 and row_stepsize == 1:
-        LOGGER.debug(f'WRITING ***** {win_xoff}, {win_yoff}')
+        LOGGER.debug(f'it is 1 for 1 now {win_xoff} {win_yoff} {win_xsize}, {win_ysize}')
         raster = gdal.OpenEx(
             target_raster_path, gdal.OF_RASTER | gdal.GA_Update)
         band = raster.GetRasterBand(1)
@@ -163,8 +165,8 @@ def multigrid_optimize(
         band = None
         raster = None
     else:
-        LOGGER.debug(f'do a multigrid at {col_stepsize} {row_stepsize}')
         k = numpy.array([[1, 1, 1], [1, 9, 1], [1, 1, 1]])
+        k = numpy.array([[0, 0, 0], [0, 9, 0], [0, 0, 0]])
         k = k/numpy.sum(k)
         mask_array = scipy.signal.convolve2d(mask_array, k, mode='same', boundary='symm')
 
@@ -172,9 +174,9 @@ def multigrid_optimize(
             if local_prop > 1:
                 local_prop = 1
             n_local_pixels = local_offset['win_xsize'] * local_offset['win_ysize']
-            LOGGER.debug(f'{local_prop * n_local_pixels}, {local_prop}')
             predicted_pixels_to_set = round(local_prop * n_local_pixels)
             if predicted_pixels_to_set == 0:
+                LOGGER.debug(f'all 0s at {local_offset}, {local_prop}')
                 raster = gdal.OpenEx(
                     target_raster_path, gdal.OF_RASTER | gdal.GA_Update)
                 band = raster.GetRasterBand(1)
@@ -187,6 +189,7 @@ def multigrid_optimize(
                 raster = None
                 continue
             if round(local_prop * n_local_pixels) == n_local_pixels:
+                LOGGER.debug(f'all 1s at {local_offset}, {local_prop}')
                 raster = gdal.OpenEx(
                     target_raster_path, gdal.OF_RASTER | gdal.GA_Update)
                 band = raster.GetRasterBand(1)
@@ -210,6 +213,7 @@ def multigrid_optimize(
             #    f'\t{xoff}, {yoff}, {win_xsize}, {win_ysize} ({xoff+win_xsize}, {yoff+win_ysize})')
 
             #var_index += 1
+
 
 def _scipy_optimize(raster_path_list, min_proportion):
     raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
@@ -242,34 +246,53 @@ def _scipy_optimize(raster_path_list, min_proportion):
     return res, tot_val, raster_results
 
 
+def _sum_over_mask(base_raster_path, mask_raster_path):
+    """Return the sum of mask==1 pixels over base."""
+    running_sum = 0.0
+    for (_, base_array), (_, mask_array) in zip(
+            pygeoprocessing.iterblocks((base_raster_path, 1)),
+            pygeoprocessing.iterblocks((mask_raster_path, 1))):
+        running_sum += numpy.sum(base_array[mask_array >= 0.5])
+    return running_sum
+
+
 def main():
     """Entry point."""
     parser = argparse.ArgumentParser(description='Calc sum given min area')
-    parser.add_argument('grid_size', type=int,)
+    parser.add_argument('n_cells', type=int,)
     args = parser.parse_args()
-    n = 64
+    raster_side_length = args.n_cells
     LOGGER.info('construct test data')
-    raster_path_list = _make_test_data('test_data', n, 10)
+
+    raster_path_list = _make_test_data('test_data', raster_side_length, 10)
     LOGGER.info('construct optimization problem')
-    #problem = _construct_optimization_problem(raster_path_list)
-    #LOGGER.info('solve optimization problem')
-    #problem.solve()
     min_proportion = 0.9
 
-    #problem, tot_val, raster_results = _scipy_optimize(raster_path_list, min_proportion)
+    current_grid_size = raster_side_length
+    with open('result.csv', 'w') as csv_file:
+        csv_file.write('grid size,')
+        csv_file.write(','.join([
+            os.path.basename(os.path.splitext(path)[0])
+            for path in raster_path_list]))
+        while current_grid_size > 1:
+            csv_file.write(f'\n{current_grid_size}')
+            target_raster_path = f'optimal_mask_{current_grid_size}.tif'
+            if os.path.exists(target_raster_path):
+                os.remove(target_raster_path)
+            pygeoprocessing.new_raster_from_base(
+                raster_path_list[0], target_raster_path, gdal.GDT_Float32, [-1])
 
-    target_raster_path = f'result{args.grid_size}.tif'
-    os.remove(target_raster_path)
-    pygeoprocessing.new_raster_from_base(
-        raster_path_list[0], target_raster_path, gdal.GDT_Float32, [-1])
-
-    raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
-    n_cols, n_rows = raster_info['raster_size']
-    LOGGER.debug(f'{n_rows} {n_cols}')
-    multigrid_optimize(
-        raster_path_list, min_proportion, target_raster_path,
-        0, 0, n_cols, n_rows,
-        prop_tol=1e-12, grid_size=args.grid_size)
+            raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
+            n_cols, n_rows = raster_info['raster_size']
+            LOGGER.debug(f'{n_rows} {n_cols} {current_grid_size}')
+            multigrid_optimize(
+                raster_path_list, min_proportion, target_raster_path,
+                0, 0, n_cols, n_rows,
+                prop_tol=1e-12, grid_size=current_grid_size)
+            for base_raster_path in raster_path_list:
+                val_sum = _sum_over_mask(base_raster_path, target_raster_path)
+                csv_file.write(f',{val_sum}')
+            current_grid_size = current_grid_size // 2
     return
 
 
