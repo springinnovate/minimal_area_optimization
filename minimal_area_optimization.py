@@ -157,7 +157,6 @@ def multigrid_optimize(
     mask_array[~valid_mask] = 0
 
     if col_stepsize == 1 and row_stepsize == 1:
-        LOGGER.debug(f'it is 1 for 1 now {win_xoff} {win_yoff} {win_xsize}, {win_ysize}')
         raster = gdal.OpenEx(
             target_raster_path, gdal.OF_RASTER | gdal.GA_Update)
         band = raster.GetRasterBand(1)
@@ -165,10 +164,10 @@ def multigrid_optimize(
         band = None
         raster = None
     else:
-        k = numpy.array([[1, 1, 1], [1, 9, 1], [1, 1, 1]])
-        k = numpy.array([[0, 0, 0], [0, 9, 0], [0, 0, 0]])
-        k = k/numpy.sum(k)
-        mask_array = scipy.signal.convolve2d(mask_array, k, mode='same', boundary='symm')
+        #k = numpy.array([[1, 1, 1], [1, 9, 1], [1, 1, 1]])
+        #k = numpy.array([[0, 0, 0], [0, 9, 0], [0, 0, 0]])
+        #k = k/numpy.sum(k)
+        #mask_array = scipy.signal.convolve2d(mask_array, k, mode='same', boundary='symm')
 
         for local_offset, local_prop in zip(offset_list, mask_array[valid_mask]):
             if local_prop > 1:
@@ -176,7 +175,6 @@ def multigrid_optimize(
             n_local_pixels = local_offset['win_xsize'] * local_offset['win_ysize']
             predicted_pixels_to_set = round(local_prop * n_local_pixels)
             if predicted_pixels_to_set == 0:
-                LOGGER.debug(f'all 0s at {local_offset}, {local_prop}')
                 raster = gdal.OpenEx(
                     target_raster_path, gdal.OF_RASTER | gdal.GA_Update)
                 band = raster.GetRasterBand(1)
@@ -189,7 +187,6 @@ def multigrid_optimize(
                 raster = None
                 continue
             if round(local_prop * n_local_pixels) == n_local_pixels:
-                LOGGER.debug(f'all 1s at {local_offset}, {local_prop}')
                 raster = gdal.OpenEx(
                     target_raster_path, gdal.OF_RASTER | gdal.GA_Update)
                 band = raster.GetRasterBand(1)
@@ -259,6 +256,7 @@ def _sum_over_mask(base_raster_path, mask_raster_path):
 def main():
     """Entry point."""
     parser = argparse.ArgumentParser(description='Calc sum given min area')
+    parser.add_argument('grid_size', type=int,)
     parser.add_argument('n_cells', type=int,)
     args = parser.parse_args()
     raster_side_length = args.n_cells
@@ -266,15 +264,16 @@ def main():
 
     raster_path_list = _make_test_data('test_data', raster_side_length, 10)
     LOGGER.info('construct optimization problem')
-    min_proportion = 0.9
+    min_proportion = 0.5
 
-    current_grid_size = raster_side_length
+    current_grid_size = args.grid_size
     with open('result.csv', 'w') as csv_file:
         csv_file.write('grid size,')
         csv_file.write(','.join([
             os.path.basename(os.path.splitext(path)[0])
             for path in raster_path_list]))
         while current_grid_size > 1:
+            LOGGER.debug(f'processing grid size {current_grid_size}')
             csv_file.write(f'\n{current_grid_size}')
             target_raster_path = f'optimal_mask_{current_grid_size}.tif'
             if os.path.exists(target_raster_path):
