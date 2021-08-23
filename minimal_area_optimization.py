@@ -2,10 +2,13 @@
 import argparse
 import logging
 import os
+import multiprocessing
+import time
 
 import pygeoprocessing
-import scipy.ndimage.morphology
 import numpy
+import scipy.ndimage.morphology
+import taskgraph
 from osgeo import gdal
 from osgeo import osr
 
@@ -104,7 +107,8 @@ def multigrid_optimize(
 
     n_col_grids = int(numpy.ceil(win_xsize / col_stepsize))
     n_row_grids = int(numpy.ceil(win_xsize / row_stepsize))
-    mask_array = numpy.full((n_row_grids, n_col_grids), -1, dtype=numpy.float32)
+    mask_array = numpy.full(
+        (n_row_grids, n_col_grids), -1, dtype=numpy.float32)
 
     A_list = [[] for _ in range(len(raster_path_list))]
     raster_sum_list = [0.0] * len(raster_path_list)
@@ -179,15 +183,12 @@ def multigrid_optimize(
         band = None
         raster = None
     else:
-        #k = numpy.array([[1, 1, 1], [1, 9, 1], [1, 1, 1]])
-        #k = numpy.array([[0, 0, 0], [0, 9, 0], [0, 0, 0]])
-        #k = k/numpy.sum(k)
-        #mask_array = scipy.signal.convolve2d(mask_array, k, mode='same', boundary='symm')
-
-        for local_offset, local_prop in zip(offset_list, mask_array[valid_mask]):
+        for local_offset, local_prop in zip(
+                offset_list, mask_array[valid_mask]):
             if local_prop > 1:
                 local_prop = 1
-            n_local_pixels = local_offset['win_xsize'] * local_offset['win_ysize']
+            n_local_pixels = (
+                local_offset['win_xsize'] * local_offset['win_ysize'])
             predicted_pixels_to_set = round(local_prop * n_local_pixels)
             if predicted_pixels_to_set == 0:
                 raster = gdal.OpenEx(
@@ -218,13 +219,7 @@ def multigrid_optimize(
                 local_offset['xoff'], local_offset['yoff'],
                 local_offset['win_xsize'], local_offset['win_ysize'],
                 prop_tol=prop_tol, grid_size=grid_size)
-    # iterate over each solution of x here and solve that subproblem
 
-            #LOGGER.debug(
-            #    f'sampling offset for x{var_index}\n'
-            #    f'\t{xoff}, {yoff}, {win_xsize}, {win_ysize} ({xoff+win_xsize}, {yoff+win_ysize})')
-
-            #var_index += 1
     return time.time() - start_time
 
 
@@ -281,7 +276,7 @@ def main():
     task_graph = taskgraph.TaskGraph('.', multiprocessing.cpu_count())
 
     test_data_task = task_graph.add_task(
-        func=_make_test_data_smooth,#_make_test_data_random,
+        func=_make_test_data_smooth,  # _make_test_data_random,
         args=('test_data', raster_side_length, 10),
         store_result=True,
         task_name='make smooth test data')
@@ -291,7 +286,8 @@ def main():
 
     current_grid_size = args.grid_size
     opt_task_list = []
-    with open('result.csv', 'w') as csv_file:
+    with open(f'result_{raster_side_length}_{args.grid_size}.csv', 'w') as \
+            csv_file:
         csv_file.write('grid size,run time,')
         csv_file.write(','.join([
             os.path.basename(os.path.splitext(path)[0])
@@ -327,20 +323,7 @@ def main():
             current_grid_size = current_grid_size // 2
     return
 
-
-    LOGGER.debug(problem.fun)
-    LOGGER.debug(problem.fun/(n*n))
-    area_proportion = sum(problem.x)/(n*n)
-    result_proportion = problem.fun/tot_val
-    LOGGER.info(f'result\n\tarea_proportion: {area_proportion:.3f}\n\tsolution proportion for each raster: {raster_results}')
-    LOGGER.info(problem.x)
-    pygeoprocessing.numpy_array_to_raster(
-        (problem.x).reshape((n, n)), -1, (1, -1), (0, 0),
-        osr.SRS_WKT_WGS84_LAT_LONG, 'result.tif')
-    #for v in problem.variables():
-    #    print(v.name, "=", v.varValue)
-
-    # multi-layer solution?
+    # multi-grid
     # 1) coarsen raster, or make grids of coarseness
     # 2) solve coarse raster, project to finer one and solve those subproblems
     #   constraint is the total area selected
