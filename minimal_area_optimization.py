@@ -2,15 +2,18 @@
 import argparse
 import logging
 import os
-import multiprocessing
 import time
 
-import pygeoprocessing
+from ecoshard import geoprocessing
 import numpy
 import scipy.ndimage.morphology
 import taskgraph
 from osgeo import gdal
 from osgeo import osr
+
+import pandas.plotting
+import matplotlib.pyplot as plt
+import pandas
 
 
 gdal.SetCacheMax(2**27)
@@ -22,19 +25,21 @@ logging.basicConfig(
         ' [%(funcName)s:%(lineno)d] %(message)s'))
 
 LOGGER = logging.getLogger(__name__)
+logging.getLogger('taskgraph').setLevel(logging.WARN)
 
 
 def _make_test_data_smooth(dir_path, n, m):
     """Make random raster test data."""
     os.makedirs(dir_path, exist_ok=True)
     raster_path_list = []
-    for raster_path, (pi, pj) in [
-            (f'{index}.tif', (int(n*index/m), 0)) for index in range(m)]:
+    for raster_path, (pi, pj) in [(
+            os.path.join(dir_path, f'smooth_{n}_{index}.tif'),
+            (int(n*index/m), 0)) for index in range(m)]:
         base_array = numpy.ones((n, n))
         base_array[pi, pj] = 0
         dist_array = scipy.ndimage.morphology.distance_transform_edt(
             base_array)
-        pygeoprocessing.numpy_array_to_raster(
+        geoprocessing.numpy_array_to_raster(
             dist_array, -1, (1, -1), (0, 0),
             osr.SRS_WKT_WGS84_LAT_LONG, raster_path)
         raster_path_list.append(raster_path)
@@ -46,9 +51,10 @@ def _make_test_data_random(dir_path, n, m):
     os.makedirs(dir_path, exist_ok=True)
     raster_path_list = []
     for raster_path, (pi, pj) in [
-            (f'{index}.tif', (int(n*index/m), 0)) for index in range(m)]:
+            (f'random_{index}.tif', (int(n*index/m), 0)) for index in range(m)]:
+        LOGGER.debug(f'{raster_path}, {pi}, {pj}')
         base_array = numpy.random.random((n, n))
-        pygeoprocessing.numpy_array_to_raster(
+        geoprocessing.numpy_array_to_raster(
             base_array, -1, (1, -1), (0, 0),
             osr.SRS_WKT_WGS84_LAT_LONG, raster_path)
         raster_path_list.append(raster_path)
@@ -61,10 +67,10 @@ def _callback(prob):
 
 def _sum_raster(raster_path):
     """Return the non-nodata sum of the raster."""
-    raster_info = pygeoprocessing.get_raster_info(raster_path)
+    raster_info = geoprocessing.get_raster_info(raster_path)
     nodata = raster_info['nodata'][0]
     running_sum = 0.0
-    for _, array in pygeoprocessing.iterblocks((raster_path, 1)):
+    for _, array in geoprocessing.iterblocks((raster_path, 1)):
         if nodata is not None:
             valid_mask = (array != nodata)
         else:
@@ -98,7 +104,7 @@ def multigrid_optimize(
         }, runtime in seconds
     """
     start_time = time.time()
-    raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
+    raster_info = geoprocessing.get_raster_info(raster_path_list[0])
 
     n_cols, n_rows = raster_info['raster_size']
 
@@ -224,7 +230,7 @@ def multigrid_optimize(
 
 
 def _scipy_optimize(raster_path_list, min_proportion):
-    raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
+    raster_info = geoprocessing.get_raster_info(raster_path_list[0])
     n_rows, n_cols = raster_info['raster_size']
     LOGGER.info('construct area list')
     c_vector = numpy.ones(n_rows*n_cols)
@@ -258,8 +264,8 @@ def _sum_over_mask(base_raster_path, mask_raster_path):
     """Return the sum of mask==1 pixels over base."""
     running_sum = 0.0
     for (_, base_array), (_, mask_array) in zip(
-            pygeoprocessing.iterblocks((base_raster_path, 1)),
-            pygeoprocessing.iterblocks((mask_raster_path, 1))):
+            geoprocessing.iterblocks((base_raster_path, 1)),
+            geoprocessing.iterblocks((mask_raster_path, 1))):
         running_sum += numpy.sum(base_array[mask_array >= 0.5])
     return running_sum
 
@@ -267,16 +273,18 @@ def _sum_over_mask(base_raster_path, mask_raster_path):
 def main():
     """Entry point."""
     parser = argparse.ArgumentParser(description='Calc sum given min area')
-    parser.add_argument('grid_size', type=int,)
     parser.add_argument('n_cells', type=int,)
+    parser.add_argument('grid_size', type=int,)
     parser.add_argument('min_size', type=int,)
     args = parser.parse_args()
     raster_side_length = args.n_cells
     LOGGER.info('construct test data')
-    task_graph = taskgraph.TaskGraph('.', multiprocessing.cpu_count())
+    task_graph = taskgraph.TaskGraph('.', -1) #multiprocessing.cpu_count())
+
+    data_type = 'smooth'
 
     test_data_task = task_graph.add_task(
-        func=_make_test_data_smooth,  # _make_test_data_random,
+        func=_make_test_data_smooth,
         args=('test_data', raster_side_length, 10),
         store_result=True,
         task_name='make smooth test data')
@@ -286,25 +294,30 @@ def main():
 
     current_grid_size = args.grid_size
     opt_task_list = []
-    with open(f'result_{raster_side_length}_{args.grid_size}.csv', 'w') as \
+    csv_file_path = f'result_{data_type}_{raster_side_length}_{args.grid_size}.csv'
+    with open(csv_file_path, 'w') as \
             csv_file:
         csv_file.write('grid size,run time,')
         csv_file.write(','.join([
             os.path.basename(os.path.splitext(path)[0])
             for path in raster_path_list]))
+        csv_file.write(',')
+        csv_file.write(',error_'.join([
+            os.path.basename(os.path.splitext(path)[0])
+            for path in raster_path_list]))
+        csv_file.write(',mean_error')
         while current_grid_size >= args.min_size:
-            LOGGER.debug(f'processing grid size {current_grid_size}')
-            csv_file.write(f'\n{current_grid_size}')
+            LOGGER.debug(f'construct {current_grid_size}')
+
             target_raster_path = (
-                f'optimal_mask_{args.n_cells}_{current_grid_size}.tif')
+                f'optimal_mask_{data_type}_{args.n_cells}_{current_grid_size}.tif')
             if not os.path.exists(target_raster_path):
-                pygeoprocessing.new_raster_from_base(
+                geoprocessing.new_raster_from_base(
                     raster_path_list[0], target_raster_path, gdal.GDT_Float32,
                     [-1])
 
-            raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
+            raster_info = geoprocessing.get_raster_info(raster_path_list[0])
             n_cols, n_rows = raster_info['raster_size']
-            LOGGER.debug(f'{n_rows} {n_cols} {current_grid_size}')
             optimization_task = task_graph.add_task(
                 func=multigrid_optimize,
                 args=(
@@ -312,22 +325,48 @@ def main():
                     0, 0, n_cols, n_rows),
                 kwargs={'prop_tol': 1e-12, 'grid_size': current_grid_size},
                 store_result=True)
-            opt_task_list.append((optimization_task, target_raster_path))
+            opt_task_list.append((current_grid_size, optimization_task, target_raster_path))
+            current_grid_size = int(current_grid_size * 0.9)
 
-    for optimization_task, target_raster_path in opt_task_list:
-        runtime = optimization_task.get()
-        csv_file.write(f',{runtime}')
-        for base_raster_path in raster_path_list:
-            val_sum = _sum_over_mask(base_raster_path, target_raster_path)
-            csv_file.write(f',{val_sum}')
-            current_grid_size = current_grid_size // 2
-    return
+        first_solution = True
+        for grid_size, optimization_task, target_raster_path in opt_task_list:
+            if first_solution:
+                expected_sum_list = []
+            LOGGER.info(f'waiting for grid size {grid_size}')
+            runtime = optimization_task.get()
+            csv_file.write(f'\n{grid_size},{runtime}')
+            error_list = []
+            for index, base_raster_path in enumerate(raster_path_list):
+                val_sum = _sum_over_mask(base_raster_path, target_raster_path)
+                csv_file.write(f',{val_sum}')
+                if first_solution:
+                    expected_sum_list.append(val_sum)
+                else:
+                    error_list.append((expected_sum_list[index]-val_sum)/expected_sum_list[index]*100)
+            if not first_solution:
+                for error in error_list:
+                    csv_file.write(f',{error}')
+                csv_file.write(f',{numpy.mean(error_list)}')
+            first_solution = False
 
-    # multi-grid
-    # 1) coarsen raster, or make grids of coarseness
-    # 2) solve coarse raster, project to finer one and solve those subproblems
-    #   constraint is the total area selected
-    #   condition is maximize the sum?d
+    ax = plt.gca()
+    ax2 = plt.twinx()
+    ax.set_ylabel('runtime (s)')
+    ax2.set_ylabel('mean % error from original')
+
+    df = pandas.read_csv(
+        csv_file_path, usecols=['grid size', 'run time', 'mean_error'])
+    ax.plot(df[1::]['grid size'], df[1::]['run time'], f'b.-', label=f'runtime (s)')
+    ax.plot(df[1::]['grid size'], df[1::]['mean_error'], f'k.--', label=f'error %')
+
+    ax.legend()
+    grid_min = df[1::]['grid size'].min()
+    grid_max = df[1::]['grid size'].max()
+    ax.set_xlim(grid_max, grid_min)  # decreasing time
+    plt.grid()
+    plt.ylabel('runtime (s)')
+    plt.show()
+
 
 
 if __name__ == '__main__':
