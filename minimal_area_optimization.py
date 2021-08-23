@@ -21,7 +21,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 
-def _make_test_data(dir_path, n, m):
+def _make_test_data_smooth(dir_path, n, m):
     """Make random raster test data."""
     os.makedirs(dir_path, exist_ok=True)
     raster_path_list = []
@@ -33,6 +33,20 @@ def _make_test_data(dir_path, n, m):
             base_array)
         pygeoprocessing.numpy_array_to_raster(
             dist_array, -1, (1, -1), (0, 0),
+            osr.SRS_WKT_WGS84_LAT_LONG, raster_path)
+        raster_path_list.append(raster_path)
+    return raster_path_list
+
+
+def _make_test_data_random(dir_path, n, m):
+    """Make random raster test data."""
+    os.makedirs(dir_path, exist_ok=True)
+    raster_path_list = []
+    for raster_path, (pi, pj) in [
+            (f'{index}.tif', (int(n*index/m), 0)) for index in range(m)]:
+        base_array = numpy.random.random((n, n))
+        pygeoprocessing.numpy_array_to_raster(
+            base_array, -1, (1, -1), (0, 0),
             osr.SRS_WKT_WGS84_LAT_LONG, raster_path)
         raster_path_list.append(raster_path)
     return raster_path_list
@@ -78,8 +92,9 @@ def multigrid_optimize(
             'objective_sum_list': [sum of selected objectives],
             'proportion_list': [proportion of raster selected],
             'area_list': [area of raster selected]
-        }
+        }, runtime in seconds
     """
+    start_time = time.time()
     raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
 
     n_cols, n_rows = raster_info['raster_size']
@@ -210,6 +225,7 @@ def multigrid_optimize(
             #    f'\t{xoff}, {yoff}, {win_xsize}, {win_ysize} ({xoff+win_xsize}, {yoff+win_ysize})')
 
             #var_index += 1
+    return time.time() - start_time
 
 
 def _scipy_optimize(raster_path_list, min_proportion):
@@ -258,39 +274,56 @@ def main():
     parser = argparse.ArgumentParser(description='Calc sum given min area')
     parser.add_argument('grid_size', type=int,)
     parser.add_argument('n_cells', type=int,)
+    parser.add_argument('min_size', type=int,)
     args = parser.parse_args()
     raster_side_length = args.n_cells
     LOGGER.info('construct test data')
+    task_graph = taskgraph.TaskGraph('.', multiprocessing.cpu_count())
 
-    raster_path_list = _make_test_data('test_data', raster_side_length, 10)
+    test_data_task = task_graph.add_task(
+        func=_make_test_data_smooth,#_make_test_data_random,
+        args=('test_data', raster_side_length, 10),
+        store_result=True,
+        task_name='make smooth test data')
+    raster_path_list = test_data_task.get()
     LOGGER.info('construct optimization problem')
     min_proportion = 0.5
 
     current_grid_size = args.grid_size
+    opt_task_list = []
     with open('result.csv', 'w') as csv_file:
-        csv_file.write('grid size,')
+        csv_file.write('grid size,run time,')
         csv_file.write(','.join([
             os.path.basename(os.path.splitext(path)[0])
             for path in raster_path_list]))
-        while current_grid_size > 1:
+        while current_grid_size >= args.min_size:
             LOGGER.debug(f'processing grid size {current_grid_size}')
             csv_file.write(f'\n{current_grid_size}')
-            target_raster_path = f'optimal_mask_{current_grid_size}.tif'
-            if os.path.exists(target_raster_path):
-                os.remove(target_raster_path)
-            pygeoprocessing.new_raster_from_base(
-                raster_path_list[0], target_raster_path, gdal.GDT_Float32, [-1])
+            target_raster_path = (
+                f'optimal_mask_{args.n_cells}_{current_grid_size}.tif')
+            if not os.path.exists(target_raster_path):
+                pygeoprocessing.new_raster_from_base(
+                    raster_path_list[0], target_raster_path, gdal.GDT_Float32,
+                    [-1])
 
             raster_info = pygeoprocessing.get_raster_info(raster_path_list[0])
             n_cols, n_rows = raster_info['raster_size']
             LOGGER.debug(f'{n_rows} {n_cols} {current_grid_size}')
-            multigrid_optimize(
-                raster_path_list, min_proportion, target_raster_path,
-                0, 0, n_cols, n_rows,
-                prop_tol=1e-12, grid_size=current_grid_size)
-            for base_raster_path in raster_path_list:
-                val_sum = _sum_over_mask(base_raster_path, target_raster_path)
-                csv_file.write(f',{val_sum}')
+            optimization_task = task_graph.add_task(
+                func=multigrid_optimize,
+                args=(
+                    raster_path_list, min_proportion, target_raster_path,
+                    0, 0, n_cols, n_rows),
+                kwargs={'prop_tol': 1e-12, 'grid_size': current_grid_size},
+                store_result=True)
+            opt_task_list.append((optimization_task, target_raster_path))
+
+    for optimization_task, target_raster_path in opt_task_list:
+        runtime = optimization_task.get()
+        csv_file.write(f',{runtime}')
+        for base_raster_path in raster_path_list:
+            val_sum = _sum_over_mask(base_raster_path, target_raster_path)
+            csv_file.write(f',{val_sum}')
             current_grid_size = current_grid_size // 2
     return
 
